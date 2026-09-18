@@ -1,7 +1,8 @@
 # Firmware Image Assembly Service
 
 FastAPI 服务：接收 Intel HEX 文本，逐行校验（字节数 + 二补校验和），按地址组装固件映像，
-返回合并后的连续 Base64 段、段间空洞、入口地址与逐行诊断。
+返回合并后的连续 Base64 段、段间空洞、入口地址与逐行诊断；并可针对一组命名内存区域
+做布局校验（覆盖率、data/entry 权限、区域占用率）。
 
 ## 快速启动（单条命令）
 
@@ -80,6 +81,66 @@ curl -s -X POST http://localhost:8000/api/v1/assemble/raw \
 - `entry_address`：最后一个 03/05 型记录给出的入口地址，无则为 `null`。
 - `diagnostics[]`：逐行结果，`line` 从 1 开始，`0` 表示文件级问题（如缺失 EOF）。
 
+### `POST /api/v1/validate-layout`
+
+在组装结果之上做内存布局校验。请求体在 `hex_text` 之外增加 `regions`，
+每个区域为半开区间 `[start, end)`：
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/validate-layout \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "hex_text": ":020000040800F2\n:10000000214601360121470136007EFE09D2190141\n:04000005080001C12D\n:00000001FF\n",
+    "regions": [
+      {"name": "flash",  "start": 134217728, "end": 134479872, "allow_data": true, "allow_entry": true},
+      {"name": "config", "start": 134479872, "end": 134484992, "allow_data": true, "allow_entry": false}
+    ]
+  }' | jq
+```
+
+响应示例（同样恒为 200）：
+
+```json
+{
+  "ok": true,
+  "hex_ok": true,
+  "regions_valid": true,
+  "error_count": 0,
+  "warning_count": 0,
+  "entry_address": 134218177,
+  "total_bytes": 16,
+  "regions": [
+    {
+      "name": "flash", "start": 134217728, "end": 134479872, "size": 262144,
+      "allow_data": true, "allow_entry": true,
+      "occupied_bytes": 16, "utilization": 0.00006103515625, "violations": []
+    },
+    {
+      "name": "config", "start": 134479872, "end": 134484992, "size": 5120,
+      "allow_data": true, "allow_entry": false,
+      "occupied_bytes": 0, "utilization": 0.0, "violations": []
+    }
+  ],
+  "violations": [],
+  "diagnostics": [ ... ]
+}
+```
+
+判定规则：
+
+- HEX 无效时只返回 `diagnostics`（`regions`/`violations` 为空、`regions_valid` 为 `null`），
+  不执行布局判断。
+- HEX 有效时先检查区域定义：每个区域须满足 `start < end`，且所有区域互不重叠
+  （相邻边界相接允许）；定义不合法时 `regions_valid=false`，不再做字节级判定。
+- 定义合法后，将固件连续段按区域边界切分，逐字节归属区域，并报告：
+  - `uncovered_data`：未被任何区域覆盖的字节范围（`region` 为 `null`）；
+  - `data_not_allowed`：落入 `allow_data=false` 区域的字节范围；
+  - `entry_uncovered` / `entry_not_allowed`：入口地址（存在时）未落入任何区域，
+    或落入 `allow_entry=false` 的区域。
+- 每个区域汇总 `occupied_bytes`（落入的固件字节数）、`utilization`
+  （`occupied_bytes / size`）及该区域关联的 `violations`；顶层 `violations`
+  汇总全部违规。`ok` 仅在 HEX 有效且无任何违规时为 `true`。
+
 ## 解析规则
 
 - 每行必须形如 `:llaaaatt<data>cc`；校验 `ll`（字节数）与实际数据长度一致，
@@ -101,8 +162,10 @@ curl -s -X POST http://localhost:8000/api/v1/assemble/raw \
 app/
   main.py        # FastAPI 应用与请求/响应模型
   hex_parser.py  # Intel HEX 解析与映像组装（纯逻辑，可独立测试）
+  layout.py      # 内存布局校验（区域定义检查、段切分、占用统计，纯逻辑）
 tests/
-  test_hex_service.py
+  test_hex_service.py      # 解析器与 assemble 接口
+  test_validate_layout.py  # validate-layout 接口与布局逻辑
 Dockerfile
 docker-compose.yml
 requirements.txt       # 运行依赖
